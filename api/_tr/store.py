@@ -46,24 +46,35 @@ def _blob_put(key: str, text: str) -> None:
     r = requests.put(f"{API}/", params={"pathname": PREFIX + key}, data=text.encode("utf-8"), headers=h, timeout=20)
     if r.status_code >= 300:
         raise RuntimeError(f"Blob put {key}: HTTP {r.status_code} {r.text[:200]}")
+    try:
+        if r.json().get("url"):
+            _urls[key] = r.json()["url"]
+    except ValueError:
+        pass
+
+
+_urls: dict[str, str] = {}
+
+
+def _blob_url(key: str) -> str:
+    # เหมือน constructBlobUrl ของ @vercel/blob: https://{storeId}.private.blob.vercel-storage.com/{pathname}
+    return _urls.get(key) or \
+        f"https://{_headers()['x-vercel-blob-store-id']}.private.blob.vercel-storage.com/{PREFIX}{key}"
 
 
 def _blob_get(key: str) -> str | None:
-    r = requests.get(API, params={"prefix": PREFIX + key, "limit": 5}, headers=_headers(), timeout=15)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Blob list {key}: HTTP {r.status_code} {r.text[:200]}")
-    blobs = [b for b in r.json().get("blobs", []) if b.get("pathname") == PREFIX + key]
-    if not blobs:
+    # cache=0 = อ่านตรงจากที่เก็บ ไม่ผ่าน CDN (กันได้ค่าเก่า/404 ที่แคชไว้หลังเพิ่งเขียน)
+    g = requests.get(_blob_url(key), params={"cache": "0"},
+                     headers={"authorization": _headers()["authorization"]}, timeout=15)
+    if g.status_code == 404:
         return None
-    url = blobs[0]["url"]
-    g = requests.get(url, headers={"authorization": _headers()["authorization"]}, timeout=15)
     if g.status_code >= 300:
         raise RuntimeError(f"Blob get {key}: HTTP {g.status_code}")
     return g.content.decode("utf-8")
 
 
 def _blob_delete(key: str) -> None:
-    requests.post(f"{API}/delete", json={"urls": [PREFIX + key]}, headers=_headers(), timeout=15)
+    requests.post(f"{API}/delete", json={"urls": [_blob_url(key)]}, headers=_headers(), timeout=15)
 
 
 # ------------------------------------------------------------------ public API
@@ -113,9 +124,18 @@ def self_test() -> dict:
     try:
         put_text(key, val)
         _cache.pop(key, None)
+        put_url = _urls.pop(key, None)      # ทดสอบอ่านด้วย URL ที่ประกอบเอง (แบบเดียวกับตอนใช้งานจริงข้ามรอบ)
         back = get_text(key)
+        out = {"backend": backend(), "ok": back == val, "read": back}
         if backend() == "vercel-blob":
+            out["url_built"] = _blob_url(key).split("/")[2]
+            out["url_put"] = (put_url or "").split("/")[2] if put_url else None
+            if put_url:
+                _urls[key] = put_url
             _blob_delete(key)
-        return {"backend": backend(), "ok": back == val, "read": back}
+            _urls.pop(key, None)
+        if not out["ok"]:
+            out["error"] = "เขียนได้แต่อ่านกลับไม่ได้ (ไม่พบไฟล์)" if back is None else "อ่านกลับได้ค่าไม่ตรง"
+        return out
     except Exception as e:  # noqa: BLE001
         return {"backend": backend(), "ok": False, "error": str(e)[:300]}
