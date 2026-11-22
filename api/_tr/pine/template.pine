@@ -1,0 +1,630 @@
+//@version=6
+// mrM Local OI v1.5 · หลายสินทรัพย์ (GOLD · EUR · BTC) เลือกข้อมูลตามกราฟอัตโนมัติ
+// v1.5: วัน S3 แสดง "S3-1W" (ทดลอง) ทดสอบทิศซ้ำเฉพาะ strike ในกรอบ ±SD ของ snapshot · วิธี A = ΔHHI ในกรอบ · วิธี B = Put ใต้ F ÷ Call เหนือ F
+// v1.4.3: ถ้า basis แบบ 5 นาทีหาคู่ราคาไม่ได้ ใช้ basis จาก timeframe ของกราฟแทน (ไม่ปล่อยเป็น n/a)
+// v1.4.2: อ่านชื่อแหล่งข้อมูลด้วย regex แบบไม่ระบุตัวอักษร (ตัด "(อ่านจากชื่อซีรีส์)" ที่ขึ้นเกิน)
+// v1.4.1: อ่านป้ายแหล่งข้อมูล (src/vd/vc) จากหัวข้อมูลโดยตรง แก้กรณีตารางไม่แสดงแถว "แหล่ง OI"
+// v1.4: ข้อมูลที่รวมหลายตลาด (BTC = Deribit + CME) แสดงแถว "แหล่ง OI" ในตาราง และ ◆ หน้าป้ายเส้น Top · ทอง/EUR เหมือนเดิม
+// v1.3: เพิ่มค่าส่งออก 6 plot ท้ายไฟล์ (OI #1–#5, OI ทิศ) ให้ indicator อื่นอ่านผ่าน input.source · การทำงานเดิมไม่เปลี่ยน
+// ⚠ ข้อตกลงค่าส่งออก: plot ท้ายไฟล์ต้องเรียง "LOI", "OI #1", "OI #2", "OI #3", "OI #4", "OI #5", "OI ทิศ" และอยู่ท้ายสุดทุกเวอร์ชันต่อจากนี้
+//   TradingView จับคู่ input.source ตามลำดับ plot · เพิ่ม plot ใหม่ได้เฉพาะหลัง "OI ทิศ" · ห้ามสลับ ลบ หรือแทรกก่อนหน้า (mrM Flow OB อ่านค่าชุดนี้)
+// v1.2: basis คิดจากแท่ง 5 นาทีเสมอ (เส้นตรงกันทุก timeframe) · ป้าย Top แสดง OI เพิ่ม/ลดของฝั่งนั้น · แจ้งชัดเมื่อข้อมูลหมดอายุ
+// Local OI profile ในกรอบ ±SD จาก IV + Scenario จากการกระจายตัวของ OI ทั้ง chain (ΔD · ΔHHI)
+// ข้อมูลมาจาก mrM OI Desk: สร้างโค้ดใหม่แล้ววางทับทั้งไฟล์ หรือวาง Data string ในช่อง "Data override"
+// สูตร: SD = F × IV × √(DTE/365) · C = strike เฉลี่ยถ่วง OI · D = SD ถ่วง OI รอบ C · HHI = Σ(สัดส่วน OI)²
+// เกณฑ์ cut (51.9 / 0.0164) มาจากงานวิจัยของอาจารย์ที่ยังไม่ผ่านการทดสอบนอกตัวอย่าง ปรับได้ใน Settings
+indicator("mrM Local OI v1.5", shorttitle = "mrM LOI", overlay = true, max_boxes_count = 500, max_lines_count = 100, max_labels_count = 100)
+
+// @@DATA_START
+string DATA_EMBED = ""
+string DATA_2 = ""
+string DATA_3 = ""
+string DATA_4 = ""
+string DATA_5 = ""
+string DATA_6 = ""
+string DATA_7 = ""
+string DATA_8 = ""
+string DATA_9 = ""
+string DATA_10 = ""
+string DATA_11 = ""
+string DATA_12 = ""
+// @@DATA_END
+
+// ═══════════════ Inputs ═══════════════
+GD = "ข้อมูล"
+string iData   = input.text_area("", "Data override (ว่าง = ใช้ข้อมูลในโค้ด)", group = GD, tooltip = "วาง Data string จาก OI Desk ได้ ถ้าไม่อยากวางโค้ดใหม่ทั้งไฟล์")
+string iAsset  = input.string("Auto", "สินทรัพย์", options = ["Auto", "GOLD", "EUR", "BTC"], group = GD, tooltip = "Auto = ดูจากกราฟ: XAU/GC → GOLD · EURUSD/6E → EUR · BTC → BTC · โค้ดหนึ่งไฟล์เก็บข้อมูลได้ทุกสินทรัพย์")
+string iPx     = input.string("Spot", "ราคาบนกราฟ", options = ["Spot", "Futures"], group = GD, tooltip = "Spot = กราฟของโบรก (เส้นจะลบ basis) · Futures = กราฟ GC / 6E / BTC ของ CME (ไม่ลบ basis)")
+string iBMode  = input.string("จากข้อมูล", "Basis", options = ["จากข้อมูล", "Auto จาก futures", "กำหนดเอง"], group = GD, tooltip = "จากข้อมูล = ใช้ basis ที่บันทึกตอน snapshot (ถ้าไม่มีจะใช้ Auto) · Auto = มัธยฐานของ futures − spot จากแท่งที่เวลาตรงกัน")
+string iFutG   = input.symbol("COMEX:GCZ2026", "Futures ทอง (Auto basis)", group = GD, tooltip = "สัญญา underlying ของซีรีส์ (QuikStrike แสดงเป็น Future: GCZ6)")
+string iFutE   = input.symbol("CME:6EZ2026", "Futures EUR (Auto basis)", group = GD, tooltip = "Euro FX รายสัปดาห์อ้างอิง 6E ไตรมาสถัดไป (เช่น 6EZ6)")
+string iFutB   = input.symbol("CME:BTCV2026", "Futures BTC (Auto basis)", group = GD, tooltip = "ออปชัน BTC อ้างอิงสัญญารายเดือนเดียวกัน (BTCV6 → BTCX6 → …) เปลี่ยนเมื่อสัญญาหมดอายุ")
+int    iBN     = input.int(20, "Auto basis: จำนวนแท่ง 5 นาที", minval = 3, maxval = 200, group = GD, tooltip = "ค่ามัธยฐานของ (futures − spot) จากแท่ง 5 นาทีล่าสุดที่มีทั้งสองราคาในเวลาเดียวกัน · คิดจาก 5 นาทีเสมอไม่ว่ากราฟจะเป็น timeframe ไหน เส้นจึงอยู่ตำแหน่งเดียวกันทุก timeframe · 20 แท่ง ≈ 100 นาที")
+float  iBMan   = input.float(0.0, "Basis กำหนดเอง", step = 0.01, group = GD)
+float  iIvOv   = input.float(0.0, "IV % (0 = ใช้ค่าจากข้อมูล)", minval = 0.0, step = 0.01, group = GD)
+string iTz     = input.string("Asia/Bangkok", "เขตเวลาที่แสดง", group = GD)
+
+GS = "Scenario"
+float iDCut   = input.float(51.9, "ΔD cut ทอง (S1 · จุด)", minval = 0.0, step = 0.1, group = GS)
+float iHCut   = input.float(0.0164, "ΔHHI cut (S2)", minval = 0.0, step = 0.0001, group = GS)
+float iDCutPct = input.float(1.27, "ΔD cut EUR / BTC (% ของ F)", minval = 0.0, step = 0.01, group = GS, tooltip = "ยังไม่มีงานวิจัยของ EUR/BTC · ค่าเริ่มต้นแปลงจาก 51.9 จุดของทองที่ราคา ~4,090 · Scenario ของ EUR/BTC จึงเป็นค่าทดลอง")
+bool  iMirror = input.bool(true, "S1 ฝั่ง BUY ใช้เกณฑ์สมมาตร (ΔD ≤ −cut)", group = GS, tooltip = "ฝั่ง SELL ของ S1 และทั้งสองฝั่งของ S2 มีตัวอย่างในเอกสาร ส่วน S1 BUY เป็นการอนุมานว่าสมมาตร")
+
+GV = "การแสดงผล"
+float  iK       = input.float(1.0, "กรอบ Local (± SD)", minval = 0.25, step = 0.25, group = GV)
+float  iRange   = input.float(3.0, "ช่วงแสดง profile (± SD)", minval = 0.5, step = 0.5, group = GV)
+int    iTopN    = input.int(5, "จำนวนเส้น Top", minval = 1, maxval = 10, group = GV)
+int    iBarW    = input.int(40, "ความยาว bar สูงสุด (แท่ง)", minval = 5, maxval = 150, group = GV)
+int    iOff     = input.int(25, "profile ห่างจากแท่งล่าสุด (แท่ง)", minval = 0, maxval = 200, group = GV)
+int    iBack    = input.int(150, "เส้น Top ย้อนหลัง (แท่ง)", minval = 10, maxval = 1000, group = GV)
+bool   iShowSD  = input.bool(true, "แสดงเส้น ±SD", group = GV)
+bool   iShowTbl = input.bool(true, "แสดงตาราง", group = GV)
+string iTblPos  = input.string("ขวาบน", "ตำแหน่งตาราง", options = ["ขวาบน", "ขวาล่าง", "ซ้ายบน", "ซ้ายล่าง"], group = GV)
+string iTxtSz   = input.string("small", "ขนาดตัวอักษร", options = ["tiny", "small", "normal"], group = GV)
+color  iCCol    = input.color(#3d7be0, "สี Call", group = GV)
+color  iPCol    = input.color(#e0742f, "สี Put", group = GV)
+
+GA = "แจ้งเตือน (ทางเดียว)"
+bool   iAlOn   = input.bool(true, "แจ้งเตือนเมื่อราคาแตะระดับ Top", group = GA)
+string iAlSide = input.string("ตาม Scenario", "ทิศ", options = ["ตาม Scenario", "BUY only", "SELL only"], group = GA, tooltip = "ตาม Scenario: S1/S2 แจ้งเฉพาะทิศที่อนุญาต · S3 ไม่แจ้ง (เลือก BUY only หรือ SELL only เองถ้าจะเล่น S3)")
+int    iAlTop  = input.int(2, "ใช้ระดับ Top 1 ถึง", minval = 1, maxval = 5, group = GA)
+float  iTol    = input.float(0.10, "ระยะนับว่าแตะ (× SD)", minval = 0.0, step = 0.05, group = GA)
+int    iCool   = input.int(15, "เว้นแจ้งซ้ำระดับเดิม (แท่ง)", minval = 1, group = GA)
+float  iTpSd   = input.float(0.5, "TP อ้างอิง (× SD)", minval = 0.0, step = 0.05, group = GA)
+float  iSlSd   = input.float(0.7, "SL อ้างอิง (× SD)", minval = 0.0, step = 0.05, group = GA)
+
+GW = "S3-1W (ทดลอง)"
+bool   iW1On  = input.bool(true, "แสดง S3-1W ในวัน S3", group = GW, tooltip = "อาจารย์แตก S3 เป็นทิศเดียว (เช่น S3-1W BUY only) · สูตรของอาจารย์ยังไม่เปิดเผย · สองวิธีนี้เป็นสมมติฐานของเรา ใช้คู่กับบันทึกทิศของอาจารย์ใน OI Desk")
+float  iW1Cut = input.float(0.0164, "วิธี A: ΔHHI ในกรอบ cut", minval = 0.0, step = 0.001, group = GW, tooltip = "HHI Call − HHI Put เฉพาะ strike ในกรอบ ±SD ของ snapshot · ≥ cut = SELL · ≤ −cut = BUY")
+float  iW1R   = input.float(1.25, "วิธี B: Put ใต้ F ÷ Call เหนือ F", minval = 1.0, step = 0.05, group = GW, tooltip = "ในกรอบ ±SD · ≥ ค่านี้ = BUY (Put รองรับด้านล่างหนากว่า) · ≤ 1/ค่านี้ = SELL")
+
+// ═══════════════ Asset + number formats ═══════════════
+string tkU = str.upper(syminfo.ticker)
+string rtU = str.upper(syminfo.root)
+string autoAsset = str.contains(tkU, "XAU") or str.contains(tkU, "GOLD") or rtU == "GC" or rtU == "MGC" ? "GOLD" : str.contains(tkU, "EURUSD") or rtU == "6E" or rtU == "M6E" ? "EUR" : str.contains(tkU, "BTC") or str.contains(tkU, "XBT") or rtU == "MBT" ? "BTC" : "GOLD"
+string gAsset = iAsset == "Auto" ? autoAsset : iAsset
+bool   isGold = gAsset == "GOLD"
+string futSym = gAsset == "EUR" ? iFutE : gAsset == "BTC" ? iFutB : iFutG
+int    pdp    = math.max(0, math.min(8, int(math.round(-math.log10(syminfo.mintick)))))
+string pf     = pdp == 0 ? "#" : "0." + str.repeat("0", pdp)
+string kf     = "#.######"
+
+// ═══════════════ Helpers ═══════════════
+f_reorder(array<float> src, array<int> idx) =>
+    array<float> out = array.new<float>()
+    for j in idx
+        out.push(src.get(j))
+    out
+
+f_side(array<float> K, array<float> O) =>
+    float tot = 0.0
+    float sk  = 0.0
+    int   n   = K.size()
+    if n > 0
+        for i = 0 to n - 1
+            float o = O.get(i)
+            tot += o
+            sk  += K.get(i) * o
+    float cen = tot > 0 ? sk / tot : na
+    float vr  = 0.0
+    float hh  = 0.0
+    if tot > 0
+        for i = 0 to n - 1
+            float o = O.get(i)
+            vr += o * math.pow(K.get(i) - cen, 2)
+            hh += math.pow(o / tot, 2)
+    [tot, cen, tot > 0 ? math.sqrt(vr / tot) : na, tot > 0 ? hh : na]
+
+f_sg(float x, string f) =>
+    na(x) ? "n/a" : (x >= 0 ? "+" : "") + str.tostring(x, f)
+
+f_gap(float g, float cut, float prev, string f) =>
+    string s = "n/a"
+    if not na(g)
+        string side = g >= 0 ? "SELL" : "BUY"
+        float  pct  = cut > 0 ? math.abs(g) / cut * 100 : na
+        s := f_sg(g, f) + " → " + side + " " + str.tostring(pct, "#") + "% ของ cut " + str.tostring(cut, f)
+        if not na(prev)
+            s += " · เดิม " + f_sg(prev, f) + (g > prev ? " ↑" : g < prev ? " ↓" : " =")
+    s
+
+f_scTxt(int sc, int dir, bool exp) =>
+    string s = sc == 1 ? "S1 · " + (dir > 0 ? "BUY only" : "SELL only") : sc == 2 ? "S2 · " + (dir > 0 ? "BUY only" : "SELL only") : sc == 3 ? "S3 · both (mean reversion ที่ Top 1–2)" : "—"
+    exp and sc > 0 ? s + " · ทดลอง" : s
+
+f_scShort(int sc, int dir) =>
+    sc == 3 ? "S3 both" : sc == 0 ? "—" : "S" + str.tostring(sc) + " " + (dir > 0 ? "BUY" : "SELL")
+
+f_row(table t, int r, string k, string v, color tc, color bg, string sz) =>
+    t.cell(0, r, k, text_color = color.new(#c9d1dc, 0), bgcolor = color.new(#141b26, 0), text_size = sz, text_halign = text.align_left)
+    t.cell(1, r, v, text_color = tc, bgcolor = bg, text_size = sz, text_halign = text.align_left)
+
+// ═══════════════ Parse + whole-chain metrics (first bar only) ═══════════════
+var array<float> aK  = array.new<float>()
+var array<float> aC  = array.new<float>()
+var array<float> aP  = array.new<float>()
+var array<float> aDC = array.new<float>()
+var array<float> aDP = array.new<float>()
+var string gSer  = ""
+var float  gLtd  = na
+var float  gT    = na
+var float  gF    = na
+var float  gB    = na
+var float  gIv   = na
+var float  gPD   = na
+var float  gPH   = na
+var float  gPT   = na
+var float  gStep = 5.0
+var string gSrc  = ""
+var float  gVD   = na
+var float  gVC   = na
+var bool   gSrcFb = false
+var string gErr  = ""
+
+var float mCTot = na
+var float mCCen = na
+var float mCDis = na
+var float mCHhi = na
+var float mPTot = na
+var float mPCen = na
+var float mPDis = na
+var float mPHhi = na
+var float mDD   = na
+var float mDH   = na
+var float mPcr  = na
+var float mPcrC = na
+var int   mScen = 0
+var int   mDir  = 0
+
+var string gHave = ""
+var float  gDCut = na
+
+if barstate.isfirst
+    bool useOv = str.length(iData) > 10
+    array<string> chunks = useOv ? array.from(iData) : array.from(DATA_EMBED, DATA_2, DATA_3, DATA_4, DATA_5, DATA_6, DATA_7, DATA_8, DATA_9, DATA_10, DATA_11, DATA_12)
+    bool take = false
+    for chk in chunks
+        string s0 = str.replace_all(str.replace_all(str.replace_all(chk, "\n", ""), "\r", ""), " ", "")
+        if str.length(s0) > 0
+            // a dataset starts with "LOI1;" header (has k=v pairs); chunks without it continue the previous dataset's rows
+            array<string> segs = str.split(s0, "LOI1;")
+            for seg in segs
+                if str.length(seg) > 0
+                    string rowsPart = seg
+                    if str.contains(seg, "=")
+                        array<string> hb = str.split(seg, "|")
+                        rowsPart := hb.size() > 1 ? hb.get(1) : ""
+                        string aA = "GOLD"
+                        array<string> hs = str.split(hb.get(0), ";")
+                        for tok in hs
+                            array<string> kv = str.split(tok, "=")
+                            if kv.size() == 2 and kv.get(0) == "a"
+                                aA := kv.get(1)
+                        gHave := gHave + (str.contains(gHave, aA) ? "" : (gHave == "" ? "" : " ") + aA)
+                        take := aA == gAsset
+                        if take
+                            aK.clear()
+                            aC.clear()
+                            aP.clear()
+                            aDC.clear()
+                            aDP.clear()
+                            gPD := na
+                            gPH := na
+                            gPT := na
+                            gB  := na
+                            gSrc := ""
+                            gVD  := na
+                            gVC  := na
+                            for tok in hs
+                                array<string> kv = str.split(tok, "=")
+                                if kv.size() == 2
+                                    string ky = kv.get(0)
+                                    string vs = kv.get(1)
+                                    float  vn = str.tonumber(vs)
+                                    if ky == "s"
+                                        gSer := vs
+                                    else if ky == "e"
+                                        gLtd := vn
+                                    else if ky == "t"
+                                        gT := vn
+                                    else if ky == "f"
+                                        gF := vn
+                                    else if ky == "b"
+                                        gB := vn
+                                    else if ky == "iv"
+                                        gIv := vn
+                                    else if ky == "pd"
+                                        gPD := vn
+                                    else if ky == "ph"
+                                        gPH := vn
+                                    else if ky == "pt"
+                                        gPT := vn
+                        if take
+                            // source tag of multi-venue data (BTC = Deribit + CME) read from the raw header
+                            string hdr = hb.get(0)
+                            string mS  = str.match(hdr, "src=[^;|]+")
+                            string mD  = str.match(hdr, "vd=[0-9.]+")
+                            string mC  = str.match(hdr, "vc=[0-9.]+")
+                            gSrc := mS != "" ? str.replace(mS, "src=", "", 0) : ""
+                            gVD  := mD != "" ? str.tonumber(str.replace(mD, "vd=", "", 0)) : na
+                            gVC  := mC != "" ? str.tonumber(str.replace(mC, "vc=", "", 0)) : na
+                            gSrcFb := false
+                            if gSrc == "" and str.startswith(gSer, "BTC-")
+                                gSrc   := "Deribit"
+                                gSrcFb := true
+                    if take and str.length(rowsPart) > 0
+                        array<string> rs = str.split(rowsPart, "/")
+                        for rw in rs
+                            array<string> fs = str.split(rw, ",")
+                            if fs.size() >= 3
+                                float fk = str.tonumber(fs.get(0))
+                                if not na(fk)
+                                    aK.push(fk)
+                                    aC.push(nz(str.tonumber(fs.get(1))))
+                                    aP.push(nz(str.tonumber(fs.get(2))))
+                                    aDC.push(fs.size() > 3 ? str.tonumber(fs.get(3)) : na)
+                                    aDP.push(fs.size() > 4 ? str.tonumber(fs.get(4)) : na)
+    if gHave == ""
+        gErr := "ยังไม่มีข้อมูล OI · สร้างโค้ดจาก mrM OI Desk หรือวาง Data string ใน Settings"
+    else if aK.size() == 0
+        gErr := "โค้ดนี้มีข้อมูล " + gHave + " แต่ไม่มีของ " + gAsset + " · ดึงข้อมูล " + gAsset + " แล้วสร้างโค้ดใหม่"
+    else
+        array<int> ix = aK.sort_indices(order.ascending)
+        aK  := f_reorder(aK, ix)
+        aC  := f_reorder(aC, ix)
+        aP  := f_reorder(aP, ix)
+        aDC := f_reorder(aDC, ix)
+        aDP := f_reorder(aDP, ix)
+        if aK.size() > 1
+            float stp = na
+            for i = 1 to aK.size() - 1
+                float d = aK.get(i) - aK.get(i - 1)
+                if d > 0
+                    stp := na(stp) ? d : math.min(stp, d)
+            gStep := nz(stp, 5.0)
+        if true
+            [ct, cc, cd, ch] = f_side(aK, aC)
+            [pt, pc, pd, ph] = f_side(aK, aP)
+            mCTot := ct
+            mCCen := cc
+            mCDis := cd
+            mCHhi := ch
+            mPTot := pt
+            mPCen := pc
+            mPDis := pd
+            mPHhi := ph
+            mDD := na(cd) or na(pd) ? na : cd - pd
+            mDH := na(ch) or na(ph) ? na : ch - ph
+            mPcr := ct > 0 ? pt / ct : na
+            float sc_ = 0.0
+            float sp_ = 0.0
+            bool  hasChg = false
+            for i = 0 to aK.size() - 1
+                if not na(aDC.get(i))
+                    sc_ += aDC.get(i)
+                    hasChg := true
+                if not na(aDP.get(i))
+                    sp_ += aDP.get(i)
+                    hasChg := true
+            mPcrC := hasChg and sc_ != 0 ? sp_ / sc_ : na
+            gDCut := isGold ? iDCut : (na(gF) ? (na(cc) ? na : iDCutPct / 100.0 * cc) : iDCutPct / 100.0 * gF)
+            if na(mDD) or na(mDH)
+                mScen := 0
+                mDir  := 0
+            else if not na(gDCut) and mDD >= gDCut
+                mScen := 1
+                mDir  := -1
+            else if not na(gDCut) and iMirror and mDD <= -gDCut
+                mScen := 1
+                mDir  := 1
+            else if mDH >= iHCut
+                mScen := 2
+                mDir  := -1
+            else if mDH <= -iHCut
+                mScen := 2
+                mDir  := 1
+            else
+                mScen := 3
+                mDir  := 0
+
+// ═══════════════ Live: basis, DTE, SD ═══════════════
+// Auto basis (v1.2): always measured on 5-minute bars, whatever the chart timeframe, so every timeframe gets the
+// same basis and the levels sit at the same price. Runs in the 5m context of the chart symbol: takes the futures'
+// last COMPLETED 5m bar (time + close; works with the delayed CME feed too), finds the spot 5m bar with the same
+// open time, and keeps the median of the last iBN (futures − spot) pairs.
+f_bas5(string fs, int n) =>
+    [ft, fc] = request.security(fs, "5", [time[1], close[1]], ignore_invalid_symbol = true)
+    var array<float> buf = array.new<float>()
+    var int lastT = 0
+    if not na(ft) and not na(fc) and int(ft) > lastT
+        for k = 0 to 8
+            if time[k] == int(ft)
+                buf.push(fc - close[k])
+                if buf.size() > n
+                    buf.shift()
+                lastT := int(ft)
+                break
+    [buf.size() >= 3 ? buf.median() : na, buf.size()]
+
+[bAuto5, bCnt] = request.security(syminfo.tickerid, "5", f_bas5(futSym, iBN), ignore_invalid_symbol = true)
+// Fallback (v1.4.3): same-timestamp median on the chart timeframe (the v1.1 method) when the 5m pairs are missing
+float futTF = request.security(futSym, timeframe.period, close, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+var array<float> bBufTF = array.new<float>()
+if barstate.isconfirmed and not na(futTF)
+    bBufTF.push(futTF - close)
+    if bBufTF.size() > iBN
+        bBufTF.shift()
+bool  use5  = not na(bAuto5) and nz(bCnt) >= 3
+float bAuto = use5 ? bAuto5 : bBufTF.size() >= 3 ? bBufTF.median() : na
+string bAutoTx = use5 ? "5m × " + str.tostring(nz(bCnt)) + " แท่ง" : "TF กราฟ × " + str.tostring(bBufTF.size()) + " แท่ง (สำรอง)"
+
+float basis = iPx == "Futures" ? 0.0 : iBMode == "กำหนดเอง" ? iBMan : iBMode == "Auto จาก futures" ? bAuto : na(gB) ? bAuto : gB
+string bSrc = iPx == "Futures" ? "กราฟ futures" : iBMode == "กำหนดเอง" ? "กำหนดเอง" : iBMode == "Auto จาก futures" or na(gB) ? "auto " + futSym + " · " + bAutoTx : "จากข้อมูล"
+float ivUse = iIvOv > 0 ? iIvOv : gIv
+
+// ═══════════════ S3-1W (ทดลอง): re-test inside the ±SD window of the snapshot ═══════════════
+var float w1H = na
+var float w1R = na
+var int   w1A = 0
+var int   w1B = 0
+if barstate.isfirst and gErr == "" and not na(gF) and not na(ivUse) and not na(gLtd)
+    float dteT = (gLtd - (na(gT) ? timenow : gT)) / 86400000.0
+    if dteT > 0
+        float sdT = gF * ivUse / 100.0 * math.sqrt(dteT / 365.0)
+        float wLo = gF - iK * sdT
+        float wHi = gF + iK * sdT
+        float tC = 0.0
+        float tP = 0.0
+        float qC = 0.0
+        float qP = 0.0
+        float pDn = 0.0
+        float cUp = 0.0
+        for i = 0 to aK.size() - 1
+            float kk = aK.get(i)
+            if kk >= wLo and kk <= wHi
+                float c = aC.get(i)
+                float p = aP.get(i)
+                tC += c
+                tP += p
+                qC += c * c
+                qP += p * p
+                if kk < gF
+                    pDn += p
+                if kk > gF
+                    cUp += c
+        w1H := tC > 0 and tP > 0 ? qC / (tC * tC) - qP / (tP * tP) : na
+        w1R := cUp > 0 ? pDn / cUp : na
+        w1A := na(w1H) ? 0 : w1H >= iW1Cut ? -1 : w1H <= -iW1Cut ? 1 : 0
+        w1B := cUp == 0 ? (pDn > 0 ? 1 : 0) : w1R >= iW1R ? 1 : w1R <= 1.0 / iW1R ? -1 : 0
+float fLive = close + nz(basis)
+float dte   = na(gLtd) ? na : (gLtd - timenow) / 86400000.0
+bool  expd  = not na(dte) and dte <= 0
+float sd    = na(ivUse) or na(dte) or dte <= 0 ? na : fLive * ivUse / 100.0 * math.sqrt(dte / 365.0)
+float pc1   = close[1]
+
+// ═══════════════ Local window + drawing (last bar) ═══════════════
+var array<box>   gBx  = array.new<box>()
+var array<line>  gLn  = array.new<line>()
+var array<label> gLb  = array.new<label>()
+var int          lastDraw = -1
+array<float>  topK  = array.new<float>()
+array<float>  topY  = array.new<float>()
+array<int>    topS  = array.new<int>()
+array<string> topTx = array.new<string>()
+float locLo  = na
+float locHi  = na
+int   locN   = 0
+float locTot = 0.0
+
+if barstate.islast and gErr == ""
+    // ---- local OI ranking inside ±k·SD (futures prices) ----
+    array<int>   li = array.new<int>()
+    array<float> lv = array.new<float>()
+    if not na(sd)
+        locLo := fLive - iK * sd
+        locHi := fLive + iK * sd
+        for i = 0 to aK.size() - 1
+            float kk = aK.get(i)
+            if kk >= locLo and kk <= locHi
+                float o = aC.get(i) + aP.get(i)
+                li.push(i)
+                lv.push(o)
+                locTot += o
+        locN := li.size()
+        if locN > 0 and locTot > 0
+            array<int> ord = lv.sort_indices(order.descending)
+            int nTop = math.min(iTopN, locN)
+            for r = 0 to nTop - 1
+                int   ii = li.get(ord.get(r))
+                float o  = lv.get(ord.get(r))
+                if o > 0
+                    float kk = aK.get(ii)
+                    bool  isC = aC.get(ii) >= aP.get(ii)
+                    float dO  = isC ? aDC.get(ii) : aDP.get(ii)
+                    topK.push(kk)
+                    topY.push(kk - nz(basis))
+                    topS.push(isC ? 1 : -1)
+                    topTx.push((gSrc != "" ? "◆ " : "") + "#" + str.tostring(topK.size()) + " " + str.tostring(kk, kf) + " " + (isC ? "C" : "P") + " " + str.tostring(o / locTot * 100, "0.0") + "%" + (na(dO) ? "" : " · OI " + (dO > 0 ? "+" : "") + str.tostring(dO, "#")))
+
+    // ---- redraw once per bar (and at bar close) ----
+    if bar_index != lastDraw or barstate.isconfirmed
+        lastDraw := bar_index
+        for b in gBx
+            b.delete()
+        gBx.clear()
+        for l in gLn
+            l.delete()
+        gLn.clear()
+        for lb in gLb
+            lb.delete()
+        gLb.clear()
+        int xL = math.max(0, bar_index - iBack)
+        int x0 = bar_index + iOff
+        int xR = x0 + iBarW + 2
+        string sz = iTxtSz == "tiny" ? size.tiny : iTxtSz == "normal" ? size.normal : size.small
+        if not na(sd)
+            // profile: call bar above the level, put bar below
+            float rLo = fLive - iRange * sd
+            float rHi = fLive + iRange * sd
+            float mx  = 0.0
+            for i = 0 to aK.size() - 1
+                if aK.get(i) >= rLo and aK.get(i) <= rHi
+                    mx := math.max(mx, math.max(aC.get(i), aP.get(i)))
+            if mx > 0
+                float hh = gStep * 0.38
+                for i = 0 to aK.size() - 1
+                    float kk = aK.get(i)
+                    if kk >= rLo and kk <= rHi and gBx.size() < 480
+                        bool  inW = kk >= locLo and kk <= locHi
+                        float y   = kk - nz(basis)
+                        float c   = aC.get(i)
+                        float p   = aP.get(i)
+                        if c > 0
+                            gBx.push(box.new(x0, y + hh, x0 + math.max(1, math.round(iBarW * c / mx)), y, border_color = color.new(iCCol, inW ? 0 : 65), bgcolor = color.new(iCCol, inW ? 30 : 80)))
+                        if p > 0
+                            gBx.push(box.new(x0, y, x0 + math.max(1, math.round(iBarW * p / mx)), y - hh, border_color = color.new(iPCol, inW ? 0 : 65), bgcolor = color.new(iPCol, inW ? 30 : 80)))
+            if iShowSD
+                float yUp = locHi - nz(basis)
+                float yDn = locLo - nz(basis)
+                gLn.push(line.new(xL, yUp, xR, yUp, color = color.new(color.gray, 20), style = line.style_dashed))
+                gLn.push(line.new(xL, yDn, xR, yDn, color = color.new(color.gray, 20), style = line.style_dashed))
+                gLb.push(label.new(xR, yUp, "+" + str.tostring(iK, "#.##") + "SD", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.gray, size = sz))
+                gLb.push(label.new(xR, yDn, "−" + str.tostring(iK, "#.##") + "SD", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.gray, size = sz))
+        if topY.size() > 0
+            for r = 0 to topY.size() - 1
+                color col = topS.get(r) > 0 ? iCCol : iPCol
+                gLn.push(line.new(xL, topY.get(r), xR, topY.get(r), color = col, width = r == 0 ? 2 : 1))
+                gLb.push(label.new(bar_index + 2, topY.get(r), topTx.get(r) + " @" + str.tostring(topY.get(r), pf), style = label.style_label_lower_left, color = color.new(color.black, 100), textcolor = col, size = sz))
+
+// ═══════════════ Status label when levels cannot be drawn ═══════════════
+var label gStat = na
+if barstate.islast
+    label.delete(gStat)
+    gStat := na
+    string why = gErr != "" ? gErr : expd ? gAsset + " " + gSer + " หมดอายุแล้ว · เส้นถูกซ่อน · ดึงซีรีส์ใหม่จาก OI Desk แล้ววางโค้ดใหม่" : ""
+    if why != ""
+        gStat := label.new(bar_index + 2, close, "mrM LOI · " + why, style = label.style_label_left, color = color.new(#141b26, 10), textcolor = color.new(#f0b35a, 0), size = size.small)
+
+// ═══════════════ Table ═══════════════
+var table tb = table.new(iTblPos == "ขวาบน" ? position.top_right : iTblPos == "ขวาล่าง" ? position.bottom_right : iTblPos == "ซ้ายบน" ? position.top_left : position.bottom_left, 2, 28, border_width = 1, border_color = color.new(#2a3446, 0))
+
+if barstate.islast and iShowTbl
+    tb.clear(0, 0, 1, 27)
+    string sz = iTxtSz == "tiny" ? size.tiny : iTxtSz == "normal" ? size.normal : size.small
+    color hBg = color.new(#22324a, 0)
+    color bBg = color.new(#141b26, 0)
+    color tx  = color.new(#e3e8ef, 0)
+    color mut = color.new(#8f9bb0, 0)
+    string st = gErr != "" ? "NO DATA" : expd ? "หมดอายุ" : "LIVE"
+    tb.cell(0, 0, "mrM Local OI v1.5", text_color = tx, bgcolor = hBg, text_size = sz, text_halign = text.align_left)
+    tb.cell(1, 0, gAsset + " · " + (gSer == "" ? "—" : gSer) + " · " + st, text_color = expd ? color.new(#ef6a6a, 0) : tx, bgcolor = hBg, text_size = sz, text_halign = text.align_left)
+    if gErr != ""
+        f_row(tb, 1, "ข้อมูล", gErr, color.new(#f0b35a, 0), bBg, sz)
+    else
+        int r = 1
+        float ageH = na(gT) ? na : (timenow - gT) / 3600000.0
+        f_row(tb, r, "Snapshot", (na(gT) ? "n/a" : str.format_time(int(gT), "dd MMM HH:mm", iTz)) + " · " + str.tostring(ageH, "0.0") + " ชม.ที่แล้ว", ageH > 24 ? color.new(#f0b35a, 0) : tx, bBg, sz)
+        r += 1
+        if gSrc != ""
+            float vD = nz(gVD)
+            float vC = nz(gVC)
+            float vT = vD + vC
+            string vTx = "◆ " + (vD > 0 ? "Deribit " + str.tostring(vD, "#,###") : "") + (vC > 0 ? (vD > 0 ? " + " : "") + "CME " + str.tostring(vC, "#,###") : "") + (vT > 0 ? " BTC" : gSrc) + (vD > 0 and vC > 0 ? " (" + str.tostring(vD / vT * 100, "0") + "% / " + str.tostring(vC / vT * 100, "0") + "%)" : "") + " · ◆ = เส้นรวมหลายตลาด" + (gSrcFb ? " (อ่านจากชื่อซีรีส์)" : "")
+            f_row(tb, r, "แหล่ง OI", vTx, color.new(#2bb3a3, 0), bBg, sz)
+            r += 1
+        f_row(tb, r, "หมดอายุ", (na(gLtd) ? "n/a" : str.format_time(int(gLtd), "dd MMM HH:mm", iTz)) + " · DTE " + (expd ? "0 (หมดแล้ว · ดึงซีรีส์ใหม่)" : str.tostring(dte, "0.000") + " วัน"), expd ? color.new(#ef6a6a, 0) : tx, bBg, sz)
+        r += 1
+        f_row(tb, r, "F / Basis", str.tostring(fLive, pf) + " · B " + (na(basis) ? "n/a" : str.tostring(basis, pf)) + " (" + bSrc + ")", na(basis) ? color.new(#ef6a6a, 0) : tx, bBg, sz)
+        r += 1
+        f_row(tb, r, "IV / SD", (na(ivUse) ? "n/a" : str.tostring(ivUse, "0.00") + "%") + " · SD " + (na(sd) ? "n/a" : str.tostring(sd, pf)), tx, bBg, sz)
+        r += 1
+        f_row(tb, r, "กรอบ ±" + str.tostring(iK, "#.##") + "SD", na(sd) ? "n/a" : "spot " + str.tostring(locLo - nz(basis), pf) + "–" + str.tostring(locHi - nz(basis), pf) + " · N " + str.tostring(locN) + " · OI " + str.tostring(locTot, "#") + (gSrc != "" ? " BTC" : ""), tx, bBg, sz)
+        r += 1
+        f_row(tb, r, "Call", "OI " + str.tostring(mCTot, "#") + (gSrc != "" ? " BTC" : "") + " · C " + str.tostring(mCCen, pf) + " · D " + str.tostring(mCDis, pf) + " · HHI " + str.tostring(mCHhi, "0.0000"), iCCol, bBg, sz)
+        r += 1
+        f_row(tb, r, "Put", "OI " + str.tostring(mPTot, "#") + (gSrc != "" ? " BTC" : "") + " · C " + str.tostring(mPCen, pf) + " · D " + str.tostring(mPDis, pf) + " · HHI " + str.tostring(mPHhi, "0.0000"), iPCol, bBg, sz)
+        r += 1
+        f_row(tb, r, "ΔD (S1)", f_gap(mDD, gDCut, gPD, pf) + (isGold ? "" : " · cut " + str.tostring(iDCutPct, "0.00") + "% ของ F"), not na(gDCut) and (mDD >= gDCut or (iMirror and mDD <= -gDCut)) ? color.new(#f0b35a, 0) : tx, bBg, sz)
+        r += 1
+        f_row(tb, r, "ΔHHI (S2)", f_gap(mDH, iHCut, gPH, "0.0000"), math.abs(nz(mDH)) >= iHCut ? color.new(#f0b35a, 0) : tx, bBg, sz)
+        r += 1
+        color scBg = mDir > 0 ? color.new(#1d6b47, 0) : mDir < 0 ? color.new(#8a2c2c, 0) : color.new(#3a4658, 0)
+        f_row(tb, r, "Scenario", f_scTxt(mScen, mDir, not isGold), color.white, scBg, sz)
+        if iW1On and mScen == 3
+            r += 1
+            string tA = w1A > 0 ? "BUY" : w1A < 0 ? "SELL" : "กลาง"
+            string tB = w1B > 0 ? "BUY" : w1B < 0 ? "SELL" : "กลาง"
+            bool   agr = w1A != 0 and w1A == w1B
+            string w1Tx = (agr ? (w1A > 0 ? "BUY only" : "SELL only") + " · A และ B ตรงกัน" : "A " + tA + " · B " + tB) + " (ΔHHI " + f_sg(w1H, "0.000") + " · P↓/C↑ " + (na(w1R) ? "n/a" : str.tostring(w1R, "0.00")) + ")"
+            color  w1Bg = agr ? (w1A > 0 ? color.new(#1d6b47, 35) : color.new(#8a2c2c, 35)) : bBg
+            f_row(tb, r, "S3-1W ทดลอง", w1Tx, agr ? color.white : (w1A != 0 or w1B != 0 ? color.new(#f0b35a, 0) : mut), w1Bg, sz)
+        r += 1
+        f_row(tb, r, "PCR", "OI " + str.tostring(mPcr, "0.00") + " · CHG " + (na(mPcrC) ? "n/a" : str.tostring(mPcrC, "0.00")) + (na(mPcrC) ? "" : " · OI ±ในป้าย = เทียบวันก่อน"), tx, bBg, sz)
+        r += 1
+        if not na(gPT)
+            f_row(tb, r, "เทียบกับ", "snapshot " + str.format_time(int(gPT), "dd MMM HH:mm", iTz), mut, bBg, sz)
+            r += 1
+        if topY.size() > 0
+            for j = 0 to topY.size() - 1
+                f_row(tb, r, j == 0 ? "Top Local OI" : "", topTx.get(j) + " @" + str.tostring(topY.get(j), pf), topS.get(j) > 0 ? iCCol : iPCol, bBg, sz)
+                r += 1
+        else
+            f_row(tb, r, "Top Local OI", expd ? "ซ่อนเพราะข้อมูลหมดอายุ · ดึงซีรีส์ใหม่" : na(sd) ? "ต้องมี IV และวันหมดอายุ" : "ไม่มี strike ในกรอบ", expd ? color.new(#f0b35a, 0) : mut, bBg, sz)
+            r += 1
+        if not na(sd)
+            f_row(tb, r, "TP / SL อ้างอิง", "TP≈" + str.tostring(iTpSd, "#.##") + "SD " + str.tostring(iTpSd * sd, pf) + " · SL≈" + str.tostring(iSlSd, "#.##") + "SD " + str.tostring(iSlSd * sd, pf) + (isGold ? " (in-sample)" : " (อ้างอิงทอง)"), mut, bBg, sz)
+
+// ═══════════════ Alerts: one direction, closed bar ═══════════════
+var map<float, int> alMap = map.new<float, int>()
+if iAlOn and gErr == "" and barstate.isrealtime and barstate.isconfirmed and not expd and not na(sd) and topY.size() > 0
+    int allow = iAlSide == "BUY only" ? 1 : iAlSide == "SELL only" ? -1 : mDir
+    if allow != 0
+        float tol = iTol * sd
+        int   nA  = math.min(iAlTop, topY.size())
+        for r = 0 to nA - 1
+            float lvl = topY.get(r)
+            float kk  = topK.get(r)
+            bool  hit = allow > 0 ? pc1 > lvl + tol and low <= lvl + tol : pc1 < lvl - tol and high >= lvl - tol
+            int   lastB = alMap.contains(kk) ? alMap.get(kk) : -100000
+            if hit and bar_index - lastB >= iCool
+                alMap.put(kk, bar_index)
+                string msg = "mrM LOI · " + gAsset + " " + gSer + " " + f_scShort(mScen, mDir) + " · " + (allow > 0 ? "BUY" : "SELL") + " แตะ " + topTx.get(r) + " @" + str.tostring(lvl, pf) + " · SD " + str.tostring(sd, pf) + " · TP≈" + str.tostring(iTpSd * sd, pf) + " SL≈" + str.tostring(iSlSd * sd, pf) + " · " + syminfo.ticker + " " + str.tostring(close, pf)
+                alert(msg, alert.freq_once_per_bar)
+
+plot(na, "LOI", display = display.none)
+
+// ═══════════════ Export สำหรับ indicator อื่น (input.source) · ห้ามสลับลำดับ ═══════════════
+// คำนวณทุกแท่งจากข้อมูล ณ แท่งนั้น: basis ของแท่งนั้น · DTE นับถึงเวลาปิดแท่ง (แท่งล่าสุดใช้ SD ตัวเดียวกับเส้นที่วาด)
+// มีค่าเฉพาะแท่งตั้งแต่เวลา snapshot (t) ถึงก่อนหมดอายุ (e) · นอกช่วง / ไม่มีข้อมูลของสินทรัพย์นี้ → na และ OI ทิศ = 0
+float xRef = barstate.islast ? timenow : time_close
+bool  xOn  = gErr == "" and not na(gLtd) and not na(xRef) and (na(gT) or xRef >= gT) and xRef < gLtd
+float xSd  = na
+if xOn and not na(ivUse)
+    xSd := barstate.islast ? sd : fLive * ivUse / 100.0 * math.sqrt((gLtd - xRef) / 86400000.0 / 365.0)
+array<float> xTop = array.new<float>()
+if xOn and not na(xSd)
+    float xLo  = fLive - iK * xSd
+    float xHi  = fLive + iK * xSd
+    float xTot = 0.0
+    array<int>   xi = array.new<int>()
+    array<float> xv = array.new<float>()
+    for i = 0 to aK.size() - 1
+        float kk = aK.get(i)
+        if kk >= xLo and kk <= xHi
+            float o = aC.get(i) + aP.get(i)
+            xi.push(i)
+            xv.push(o)
+            xTot += o
+    if xi.size() > 0 and xTot > 0
+        array<int> xo = xv.sort_indices(order.descending)
+        int nX = math.min(iTopN, xi.size())
+        for r = 0 to nX - 1
+            float o = xv.get(xo.get(r))
+            if o > 0 and xTop.size() < 5
+                xTop.push(aK.get(xi.get(xo.get(r))) - nz(basis))
+plot(xTop.size() > 0 ? xTop.get(0) : na, "OI #1", display = display.data_window)
+plot(xTop.size() > 1 ? xTop.get(1) : na, "OI #2", display = display.data_window)
+plot(xTop.size() > 2 ? xTop.get(2) : na, "OI #3", display = display.data_window)
+plot(xTop.size() > 3 ? xTop.get(3) : na, "OI #4", display = display.data_window)
+plot(xTop.size() > 4 ? xTop.get(4) : na, "OI #5", display = display.data_window)
+plot(xOn ? mDir : 0, "OI ทิศ", display = display.data_window, precision = 0)

@@ -1,0 +1,41 @@
+{
+ "GOLD": {
+  "fut": "GCZ6",
+  "oi_date": "2026-11-20",
+  "chg_vs": "11/19/2026",
+  "series": "G4MX6",
+  "t_ms": 1795250799919,
+  "e_ms": 1795458600000,
+  "n_rows": 174,
+  "note": "QuikStrike OI 2026-11-20 (ดึงโดย Claude)"
+ },
+ "EUR": {
+  "fut": "6EZ6",
+  "oi_date": "2026-11-20",
+  "chg_vs": "11/19/2026",
+  "series": "EU4X6",
+  "t_ms": 1795250799919,
+  "e_ms": 1795791600000,
+  "n_rows": 31,
+  "note": "QuikStrike OI 2026-11-20 (ดึงโดย Claude)"
+ },
+ "BTC": {
+  "fut": "BTCX6",
+  "src": "Deribit+CME",
+  "vd": 108124,
+  "vc": 3920,
+  "note": "Deribit 27NOV26 (108,124 BTC) + CME BTCX6 OI 2026-11-20 (784 สัญญา ×5 BTC) · IV จาก Deribit mark IV",
+  "series": "BTC-27NOV26",
+  "t_ms": 1795252265382,
+  "e_ms": 1795766400000,
+  "n_rows": 100
+ },
+ "_pine": {
+  "t_ms": 1795252265414,
+  "assets": [
+   "BTC BTC-27NOV26",
+   "GOLD G4MX6",
+   "EUR EU4X6"
+  ]
+ }
+}
